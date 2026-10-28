@@ -1,0 +1,9 @@
+# same graph as tiny.graph, in CSR form
+# line 1: n m source
+# line 2: row_ptr (n+1 values), out-edges of u are at positions row_ptr[u] .. row_ptr[u+1]-1
+# line 3: col_idx (m values), destination of each edge
+# line 4: weights (m values)
+8 11 0
+0 2 4 7 8 9 10 10 11
+1 2 3 6 1 3 5 4 6 4 0
+4 1 1 4 2 5 7 3 0 1 2

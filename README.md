@@ -66,7 +66,7 @@ The same algorithms run on top of different graph representations. These live be
 .
 ├── include/
 │   ├── graph/          # Graph API: CSR, COO, dynamic CSR (CPU + GPU)
-│   └── common/         # update batch format, timers, CUDA error checks, test_graph.h
+│   └── common/         # update batch format, timers, CUDA error checks
 ├── src/
 │   ├── graph/          # graph storage implementations
 │   ├── cpu/            # Dijkstra, CPU dynamic SSSP, CPU APSP
@@ -77,7 +77,7 @@ The same algorithms run on top of different graph representations. These live be
 │   └── plot.py         # turns benchmark CSVs into plots
 ├── tests/              # compares every implementation against CPU Dijkstra
 ├── data/
-│   └── test/           # small test graphs + expected answers
+│   └── test/           # example graph + expected answers
 ├── results/            # benchmark CSVs and plots
 ├── README.md
 └── division.md         # who does what
@@ -98,59 +98,64 @@ make -j
 ./dyn_sssp ... --verify
 ```
 
-## Testing your code
+## Example graph for testing
 
-There are two small test graphs in `data/test/`, each with a few update batches and the correct
-distances after every batch:
+`data/test/` has one small example graph (`tiny`) to check that your algorithm works. It comes with
+update batches and the correct distances after each one. All of the code is ours to write; these files are only inputs and answers.
 
-- **`tiny`**: 8 vertices, made by hand so you can check it on paper (answers below)
-- **`random1k`**: 1000 vertices, 8000 edges, random weights
+### The graph (source = 0)
 
-### File format
-
-```
-tiny.graph          first line: n m source, then one edge per line: u v w   (0-indexed, directed)
-tiny.batch1         first line: k, then one update per line, applied in order:
-                      I u v w   insert edge
-                      D u v     delete edge
-                      U u v w   change weight
-tiny.expected0      correct distances on the initial graph: one "v dist" per line ("inf" = unreachable)
-tiny.expected1      correct distances after batch 1, and so on
-```
-
-### How to use it
-
-`include/common/test_graph.h` loads the files and gives you the graph in CSR form
-(`row_ptr`, `col_idx`, `weights`) to copy to the GPU. Your SSSP should return a
-`std::vector<float>` of distances, with `INF` for unreachable vertices:
-
-```cpp
-#include "common/test_graph.h"
-using namespace testgraph;
-
-TestCase tc = load_test_case("data/test", "tiny");
-std::vector<float> dist = my_sssp(to_csr(tc.graph), tc.graph.source);
-check_distances(dist, tc.expected[0], "tiny initial");   // prints [ OK ] or the wrong vertices
-```
-
-`tests/example_check.cpp` is a complete example: it runs Dijkstra on both graphs and checks every batch.
-Copy it and swap in your own function:
-
-```bash
-g++  -std=c++17 -O2 -I include tests/example_check.cpp -o example_check     # CPU
-nvcc -std=c++17 -O2 -I include tests/your_test.cu -o your_test               # GPU
-./example_check data/test
-```
-
-### `tiny` answers (source = 0)
+8 vertices, 11 directed edges, 0-indexed. Edge list form (`tiny.graph`):
 
 ```
-initial                              0:0  1:3  2:1  3:4  4:7   5:8  6:7  7:inf
-batch 1: D 2 1, D 3 4                0:0  1:4  2:1  3:5  4:9   5:8  6:8  7:inf
-batch 2: I 0 5 2, I 6 7 1            0:0  1:4  2:1  3:5  4:3   5:2  6:3  7:4
-batch 3: D 0 2, U 0 1 1, D 5 4,      0:0  1:1  2:inf 3:2 4:12  5:2  6:5  7:6
-         I 5 4 10
+8 11 0          <- n m source
+0 1 4           <- edge u -> v with weight w
+0 2 1
+1 3 1
+1 6 4
+2 1 2
+2 3 5
+2 5 7
+3 4 3
+4 6 0
+5 4 1
+7 0 2
 ```
+
+The same graph in CSR form (`tiny.csr`):
+
+```
+8 11 0                        <- n m source
+0 2 4 7 8 9 10 10 11          <- row_ptr (n+1): out-edges of u are at row_ptr[u] .. row_ptr[u+1]-1
+1 2 3 6 1 3 5 4 6 4 0         <- col_idx (m):   destination of each edge
+4 1 1 4 2 5 7 3 0 1 2         <- weights (m)
+```
+
+Tricky cases it covers: a zero-weight edge (`4 -> 6`), two equal-cost shortest paths to vertex 6,
+and vertex 7, which no edge points to, so it starts unreachable.
+
+### Update batches
+
+Each batch is applied in order. `I u v w` = insert edge, `D u v` = delete edge, `U u v w` = change weight.
+
+| Batch | Updates | What it tests |
+|-------|---------|---------------|
+| `tiny.batch1` | `D 2 1`, `D 3 4` | Deleting shortest-path tree edges, so 1's subtree has to be repaired |
+| `tiny.batch2` | `I 0 5 2`, `I 6 7 1` | Insertions that lower distances; vertex 7 becomes reachable |
+| `tiny.batch3` | `D 0 2`, `U 0 1 1`, `D 5 4`, `I 5 4 10` | Vertex 2 becomes unreachable, a weight drops, and an edge is deleted then re-inserted |
+
+### Correct distances
+
+Also in `tiny.expected0` .. `tiny.expected3` (one `v dist` per line):
+
+| After | v0 | v1 | v2 | v3 | v4 | v5 | v6 | v7 |
+|-------|----|----|----|----|----|----|----|----|
+| initial graph | 0 | 3 | 1 | 4 | 7 | 8 | 7 | inf |
+| batch 1 | 0 | 4 | 1 | 5 | 9 | 8 | 8 | inf |
+| batch 2 | 0 | 4 | 1 | 5 | 3 | 2 | 3 | 4 |
+| batch 3 | 0 | 1 | inf | 2 | 12 | 2 | 5 | 6 |
+
+Your static version (recompute after each batch) and your dynamic version should both produce every row of this table.
 
 ## Datasets
 
