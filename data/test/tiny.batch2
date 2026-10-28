@@ -1,0 +1,4 @@
+# insertions that decrease distances; vertex 7 becomes reachable
+2
+I 0 5 2
+I 6 7 1

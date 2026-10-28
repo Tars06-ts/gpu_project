@@ -1,0 +1,6 @@
+# mixed: vertex 2 becomes unreachable, weight decrease, delete+reinsert same edge
+4
+D 0 2
+U 0 1 1
+D 5 4
+I 5 4 10
