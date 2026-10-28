@@ -66,7 +66,7 @@ The same algorithms run on top of different graph representations. These live be
 .
 ├── include/
 │   ├── graph/          # Graph API: CSR, COO, dynamic CSR (CPU + GPU)
-│   └── common/         # update batch format, timers, CUDA error checks
+│   └── common/         # update batch format, timers, CUDA error checks, test_graph.h
 ├── src/
 │   ├── graph/          # graph storage implementations
 │   ├── cpu/            # Dijkstra, CPU dynamic SSSP, CPU APSP
@@ -76,7 +76,8 @@ The same algorithms run on top of different graph representations. These live be
 │   ├── gen_updates.py  # generates random update batches
 │   └── plot.py         # turns benchmark CSVs into plots
 ├── tests/              # compares every implementation against CPU Dijkstra
-├── data/               # datasets (gitignored, download script only)
+├── data/
+│   └── test/           # small test graphs + expected answers
 ├── results/            # benchmark CSVs and plots
 ├── README.md
 └── division.md         # who does what
@@ -95,6 +96,60 @@ make -j
 
 # check against CPU Dijkstra
 ./dyn_sssp ... --verify
+```
+
+## Testing your code
+
+There are two small test graphs in `data/test/`, each with a few update batches and the correct
+distances after every batch:
+
+- **`tiny`**: 8 vertices, made by hand so you can check it on paper (answers below)
+- **`random1k`**: 1000 vertices, 8000 edges, random weights
+
+### File format
+
+```
+tiny.graph          first line: n m source, then one edge per line: u v w   (0-indexed, directed)
+tiny.batch1         first line: k, then one update per line, applied in order:
+                      I u v w   insert edge
+                      D u v     delete edge
+                      U u v w   change weight
+tiny.expected0      correct distances on the initial graph: one "v dist" per line ("inf" = unreachable)
+tiny.expected1      correct distances after batch 1, and so on
+```
+
+### How to use it
+
+`include/common/test_graph.h` loads the files and gives you the graph in CSR form
+(`row_ptr`, `col_idx`, `weights`) to copy to the GPU. Your SSSP should return a
+`std::vector<float>` of distances, with `INF` for unreachable vertices:
+
+```cpp
+#include "common/test_graph.h"
+using namespace testgraph;
+
+TestCase tc = load_test_case("data/test", "tiny");
+std::vector<float> dist = my_sssp(to_csr(tc.graph), tc.graph.source);
+check_distances(dist, tc.expected[0], "tiny initial");   // prints [ OK ] or the wrong vertices
+```
+
+`tests/example_check.cpp` is a complete example: it runs Dijkstra on both graphs and checks every batch.
+Copy it and swap in your own function:
+
+```bash
+g++  -std=c++17 -O2 -I include tests/example_check.cpp -o example_check     # CPU
+nvcc -std=c++17 -O2 -I include tests/your_test.cu -o your_test               # GPU
+./example_check data/test
+```
+
+### `tiny` answers (source = 0)
+
+```
+initial                              0:0  1:3  2:1  3:4  4:7   5:8  6:7  7:inf
+batch 1: D 2 1, D 3 4                0:0  1:4  2:1  3:5  4:9   5:8  6:8  7:inf
+batch 2: I 0 5 2, I 6 7 1            0:0  1:4  2:1  3:5  4:3   5:2  6:3  7:4
+batch 3: D 0 2, U 0 1 1, D 5 4,      0:0  1:1  2:inf 3:2 4:12  5:2  6:5  7:6
+         I 5 4 10
 ```
 
 ## Datasets
