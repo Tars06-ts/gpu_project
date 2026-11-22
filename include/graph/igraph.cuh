@@ -1,6 +1,8 @@
 #ifndef IGRAPH_CUH
 #define IGRAPH_CUH
 
+#define MIN_SLACK 20
+
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
@@ -57,21 +59,29 @@ public:
 };
 
 struct CSRView {
-	// number of vertices, edges
+	// maximum number of vertices
+	int max_n_v;
+	// number of active vertices, edges
 	int n_v, n_e;
+	// index of max, min active vertex
+	int max_v, min_v;
 	// track valid and invalid (removed) vertices
 	bool* valid;
 	// edges and weights stored as in- and out-neighbors
 	// trading data duplication with faster access
 	// *_offset has n_v+1 elements
 	// *_edges, *_weights has n_e elements
-	int *in_offset, *in_edges, *in_weights;
-	int *out_offset, *out_edges, *out_weights;
+	int *in_offset, *in_edges, *in_weights, *in_used;
+	int *out_offset, *out_edges, *out_weights, *out_used;
 };
 
 class CSR : public IGraph {
-	// number of vertices, edges
+	// maximum number of vertices
+	int max_n_v;
+	// number of active vertices, edges
 	int n_v, n_e;
+	// index of max, min active vertex
+	int max_v, min_v;
 	// track valid and invalid (removed) vertices
 	std::vector<bool> valid;
 	// edges and weights stored as in- and out-neighbors
@@ -81,20 +91,27 @@ class CSR : public IGraph {
 	std::vector<int> in_offset, in_edges, in_weights, in_used;
 	std::vector<int> out_offset, out_edges, out_weights, out_used;
 	// for transferring into gpu
-	int *d_in_offset, *d_in_edges, *d_in_weights;
-	int *d_out_offset, *d_out_edges, *d_out_weights;
+	int *d_n_v, *d_n_e;
+	int *d_in_offset, *d_in_edges, *d_in_weights, *d_in_used;
+	int *d_out_offset, *d_out_edges, *d_out_weights, *d_out_used;
+	bool *d_valid;
 	// pointer to graph inside gpu
 	CSRView* d_ptr;
+	bool gpu_dirty;
 
 public:
 	/* initializes graph with given number of vertices
-	 * n_v: number of vertices*/
-	CSR(int n_v);
+	 * n_v: number of vertices
+	 * max_n_v: maximum number of vertices in graph
+	 *			including ones that can be inserted in future*/
+	CSR(int n_v, int max_n_v);
 	/* builds graphs from edge list
 	 * n_v: number of vertices
+	 * max_n_v: maximum number of vertices in graph
+	 *			including ones that can be inserted in future
 	 * n_e: number of edges
 	 * edge_list: (u,v,weight) triplets*/
-	CSR(int n_v, Edge* edge_list, int n_e);
+	CSR(int n_v, int max_n_v, Edge* edge_list, int n_e);
 	~CSR() = default;
 
     /* returns number of vertices in graph*/
@@ -114,12 +131,15 @@ public:
 	 * -1 if invalid (assume positive weights only)*/
 	int get_weight(int u, int v) override;
 	/* fills into buf atmost n in-neighbors of u
+	 * assumes buffer has been allocated in device
 	 * returns number of in-neighbors filled into buf*/
 	int get_in_neighbors(int u, Neighbor* buf, int n) override;
 	/* fills into buf atmost n out-neighbors of u
+	 * assumes buffer has been allocated in device
 	 * returns number of out-neighbors filled into buf*/
 	int get_out_neighbors(int u, Neighbor* buf, int n) override;
 	/* fills into buf atmost n edges of Graph
+	 * assumes buffer has been allocated in device
 	 * returns number of edges filled into buf*/
 	int edge_list(Edge* buf, int n) override;
 	/* removes all edges of vertex and marks vertex to be deleted*/
@@ -127,11 +147,15 @@ public:
 	/* applies n_ins insertions and n_del deletions
 	 * ignores invalid deletions of non-existent vertices or edges
 	 * updates weights for insertion of existing edges
-	 * inserts new vertices if required by insertions*/
+	 * inserts new vertices if required by insertions
+	 * assumes ins, del have been allocated in device*/
 	void apply(Edge* ins, int n_ins, 
 			   Edge* del, int n_del) override;
-	/* copies the graph to gpu as CSRView struct and returns pointer*/
+	/* copies the graph to gpu as CSRView struct and returns pointer
+	 * ignores if cpu's copy is stale compared to gpu's copy*/
 	CSRView* to_gpu();
+	/* synchronizes the graph between gpu to cpu */
+	void sync_graph();
 	/* returns device pointer to allocated graph in gpu
 	 * undefined if to_gpu() is not called*/
 	CSRView* view();
@@ -148,31 +172,3 @@ public:
 
 #endif
 
-#ifndef CUDA_CHECK_H
-#define CUDA_CHECK_H
-
-// Macro for Runtime API calls (returns cudaError_t)
-#define CUDA_CHECK(call)                                                 \
-    do {                                                                 \
-        cudaError_t result = (call);                                     \
-        if (result != cudaSuccess) {                                     \
-            std::fprintf(stderr, "CUDA Runtime Error:\n");               \
-            std::fprintf(stderr, "  File: %s\n  Line: %d\n",             \
-                         __FILE__, __LINE__);                            \
-            std::fprintf(stderr, "  Error: %s (%s)\n",                   \
-                         cudaGetErrorName(result),                       \
-                         cudaGetErrorString(result));                    \
-            std::exit(EXIT_FAILURE);                                     \
-        }                                                                \
-    } while (0)
-#endif
-
-#ifndef FATAL_H
-#define FATAL_H
-
-#define FATAL(format, ...) do { \
-		fprintf(stderr, "[FATAL] (%s:%d): " format "\n", __FILE__, __LINE__, ##__VA_ARGS__); \
-		exit(EXIT_FAILURE); \
-	} while(0)
-
-#endif
