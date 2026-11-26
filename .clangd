@@ -1,0 +1,2 @@
+CompileFlags:
+  Add: [-I/home/tar/gpu_project/include, -std=c++20]
