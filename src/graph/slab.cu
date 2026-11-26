@@ -1,6 +1,10 @@
+#include <cstddef>
+#include <cstdint>
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <algorithm>
+#include <device_atomic_functions.h>
+#include <sys/types.h>
 #include "graph/slab.cuh"
 #include "graph/checks.cuh"
 #include "graph/primitives.cuh"
@@ -135,18 +139,26 @@ __device__ int warp_delete(const SlabDir& d, uint32_t u, uint32_t key){
  * =================================================================== */
 
 // pool[i] == false -> skip (use it for the output of your drop-invalid / dedup step)
+
 __global__ void k_insert(SlabView* G, const Edge* ins, int n_ins, const bool* pool){
 	for (int i = warp_gid(); i < n_ins; i += warps_total()){
 		if (pool && !pool[i]) continue;                    // warp-uniform
 		Edge e = ins[i];
-		int r = warp_upsert(G->out, e.u, e.v, e.weight);   // u's out-list gets v
-		warp_upsert(G->in,  e.v, e.u, e.weight);           // v's in-list gets u
-		if (lane_id() == 0 && r == 1){                     // genuinely new edge
-			atomicAdd(&G->out.deg[e.u], 1);
-			atomicAdd(&G->in.deg[e.v], 1);
-			atomicAdd(&G->n_e, 1);
+		int r_out = warp_upsert(G->out, e.u, e.v, e.weight);   // u's out-list gets v
+		int r_in = warp_upsert(G->in,  e.v, e.u, e.weight);           // v's in-list gets u
+		if (lane_id() == 0 ){ 
+			if (r_out==1) {
+				atomicAdd(&G->out.deg[e.u], 1); 
+				atomicAdd(&G->n_e, 1);
+			}     
+			if (r_in == 1) atomicAdd(&G->in.deg[e.v], 1);
+			
 		}
-		// TODO: what should happen if r == -1 (pool exhausted)? at least don't lose it silently
+		if (lane_id() == 0 && (r_in ==-1 || r_out == -1)){
+			int slot= atomicAdd(&G->n_failed, 1);
+			G->failed_idx[slot] = i;
+		}
+		// DONE: what should happen if r == -1 (pool exhausted)? at least don't lose it silently
 	}
 }
 
@@ -154,25 +166,105 @@ __global__ void k_delete(SlabView* G, const Edge* del, int n_del){
 	for (int i = warp_gid(); i < n_del; i += warps_total()){
 		Edge e = del[i];
 		if (e.u < 0 || e.u >= G->max_n_v || e.v < 0 || e.v >= G->max_n_v) continue;
-		int r = warp_delete(G->out, e.u, e.v);
-		warp_delete(G->in, e.v, e.u);
-		if (lane_id() == 0 && r == 1){
-			atomicSub(&G->out.deg[e.u], 1);
-			atomicSub(&G->in.deg[e.v], 1);
-			atomicSub(&G->n_e, 1);
+		int r_out = warp_delete(G->out, e.u, e.v);
+		int r_in = warp_delete(G->in, e.v, e.u);
+		if (lane_id() == 0){
+			if (r_out == 1){
+				atomicSub(&G->out.deg[e.u], 1);
+				atomicSub(&G->n_e, 1);
+			}
+			if (r_in == 1)atomicSub(&G->in.deg[e.v], 1);
 		}
 	}
 }
 
-// TODO k_neighbors(SlabDir d, int u, Neighbor* buf, int n_buf, int* count)
+__global__ void k_neighbours(SlabDir d, int u, Neighbor* buf, int n_buf, int* count){
+	const int lane = lane_id();
+	uint32_t cur = u;
+	while (cur != NULL_SLAB){
+		const uint32_t* s = slab_at(d, cur);
+		uint32_t key = __ldcg(s+lane);
+		uint32_t wt = __shfl_down_sync(FULL_MASK, key, 1);
+
+		bool live = is_key_lane(lane) && key !=EMPTY_KEY && key != TOMBSTONE;
+		uint32_t bits = __ballot_sync(FULL_MASK, live);
+		int base=0;
+		if (lane == 0){
+			base = atomicAdd(count, __popc(bits));
+		}
+		base = __shfl_sync(FULL_MASK, base, 0);
+		if (live){
+			int slot = base +__popc(bits & ((1u << lane) - 1));
+			if (slot < n_buf) buf[slot] = {(int)key, (int)wt};
+		}
+		cur = __shfl_sync(FULL_MASK, key, NEXT_LANE);
+	}
+}
+
+__global__ void k_edge_list(SlabView* G, Edge* buf, int n_buf, int* count){
+	const int lane = lane_id();
+	for (int u = warp_gid(); u< G->max_n_v; u+=warps_total()){
+		if (!G->valid[u]) continue;
+		uint32_t cur = u;
+		while (cur != NULL_SLAB){
+			const uint32_t* s = slab_at(G->out, cur);
+			uint32_t key = __ldcg(s+lane);
+			uint32_t wt = __shfl_down_sync(FULL_MASK, key, 1);
+
+			bool live = is_key_lane(lane) && key !=EMPTY_KEY && key != TOMBSTONE;
+			uint32_t bits = __ballot_sync(FULL_MASK, live);
+			int base=0;
+			if (lane == 0){
+				base = atomicAdd(count, __popc(bits));
+			}
+			base = __shfl_sync(FULL_MASK, base, 0);
+			if (live){
+				int slot = base +__popc(bits & ((1u << lane) - 1));
+				if (slot < n_buf) buf[slot] = {u, (int)key, (int)wt};
+			}
+			cur = __shfl_sync(FULL_MASK, key, NEXT_LANE);
+		}
+	}
+}
+
+__global__ void k_remove_vertex(SlabView* G, int u){
+	const int lane = lane_id();
+	for (int dir = 0; dir < 2; dir ++){
+		const SlabDir& mine = (dir == 0) ? G->out : G->in;
+		const SlabDir& other = (dir ==0) ? G->in : G->out;
+
+		uint32_t cur = u;
+		while (cur != NULL_SLAB){
+			const uint32_t* s = slab_at(mine, cur);
+			uint32_t key = __ldcg(s+lane);
+
+			bool live = is_key_lane(lane) && key !=EMPTY_KEY && key != TOMBSTONE;
+			uint32_t bits = __ballot_sync(FULL_MASK, live);
+			int base=0;
+			while (bits){
+				int src = __ffs(bits) - 1;
+    			uint32_t nb = __shfl_sync(FULL_MASK, key, src);
+				int r = warp_delete(other, nb, u);
+				if (lane == 0 && r==1){
+						atomicSub(&other.deg[nb], 1);
+						atomicSub(&G->n_e, 1);
+				}
+				bits&=bits -1;
+			}
+			cur = __shfl_sync(FULL_MASK, key, NEXT_LANE);
+		}
+	}
+}
+
+// DONE k_neighbors(SlabDir d, int u, Neighbor* buf, int n_buf, int* count)
 //   single warp walks u's chain. per slab:
 //     live  = is_key_lane(lane) && key != EMPTY_KEY && key != TOMBSTONE
 //     bits  = __ballot_sync(FULL_MASK, live)
 //     lane 0: base = atomicAdd(count, __popc(bits)) ; broadcast base with __shfl_sync
 //     each live lane writes to base + popc(bits & ((1u << lane) - 1)) if < n_buf
 //     (weight is in the next lane -> __shfl_down_sync)
-// TODO k_edge_list(...)           same pattern, warp per vertex u in [min_v, max_v]
-// TODO k_remove_vertex(...)       see notes: you have in+out lists, so you don't need to scan the whole graph
+// DONE k_edge_list(...)           same pattern, warp per vertex u in [min_v, max_v]
+// DONE k_remove_vertex(...)       see notes: you have in+out lists, so you don't need to scan the whole graph
 
 /* =====================================================================
  *  HOST
@@ -284,13 +376,34 @@ void SlabGraph::apply(Edge* ins, int n_ins, Edge* del, int n_del){
 		// TODO (same as CSR::ins_filter): drop out-of-range ids, dedup (keep latest per (u,v)),
 		//      mark + activate new vertices, update n_v / min_v / max_v, then push_scalars().
 		//      -> gives you a bool pool[n_ins] to pass instead of nullptr below.
+
+		// buffer where the kernel records indices (into ins) of edges that failed to insert
+		int* d_failed;
+		CUDA_CHECK(cudaMalloc((void**)&d_failed, sizeof(int) * n_ins));
+		CUDA_CHECK(cudaMemcpy((char*)d_ptr + offsetof(SlabView, failed_idx),
+		                      &d_failed, sizeof(int*), cudaMemcpyHostToDevice));
+		// reset the failure counter (it lives inside the device struct)
+		CUDA_CHECK(cudaMemset((char*)d_ptr + offsetof(SlabView, n_failed), 0, sizeof(int)));
+
 		launch_dims((long long)n_ins * 32, blocks, tpb);
 		k_insert<<<blocks, tpb>>>(d_ptr, ins, n_ins, nullptr);
 		CUDA_CHECK(cudaGetLastError());
 		CUDA_CHECK(cudaDeviceSynchronize());
+
+		// how many insertions failed?
+		int n_failed = 0;
+		CUDA_CHECK(cudaMemcpy(&n_failed, (char*)d_ptr + offsetof(SlabView, n_failed),
+		                      sizeof(int), cudaMemcpyDeviceToHost));
+		if (n_failed > 0){
+			// TODO: grow the pool, then re-run k_insert on just the edges
+			//       ins[d_failed[0..n_failed)]  (d_failed holds indices, not edges)
+		}
+
+		cudaFree(d_failed);
 	}
 	pull_scalars();   // n_e was updated on the device by the kernels
 
+	
 	// TODO: check h_out.next_free / h_in.next_free against pool_cap -> pool exhausted?
 }
 

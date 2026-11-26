@@ -43,6 +43,8 @@ struct SlabView {
 	bool* valid;
 	SlabDir out;
 	SlabDir in;
+	int n_failed;
+	int* failed_idx;
 };
 
 class SlabGraph : public IGraph {
