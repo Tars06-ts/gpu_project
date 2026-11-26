@@ -33,6 +33,8 @@ struct SlabDir {
 	uint32_t* next_free;   // device scalar: bump allocator, next unused slab index
 	uint32_t  pool_cap;    // total slabs in pool
 	int*      deg;         // live degree per vertex
+	uint32_t* bucket_off;   // NEW: max_n_v + 1 entries
+
 };
 
 // device-side view, same role as CSRView
@@ -83,7 +85,7 @@ private:
 	bool*     d_valid = 0;
 	SlabDir   h_out{}, h_in{};         // host copies of the device pointers (for cudaFree)
 
-	void alloc_dir(SlabDir& d, uint32_t cap);
+	void alloc_dir(SlabDir& d, const std::vector<uint32_t>& bucket_off, uint32_t extra);
 	void free_dir(SlabDir& d);
 	void push_scalars();
 	void pull_scalars();

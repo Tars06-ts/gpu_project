@@ -1,9 +1,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cuda.h>
+#include <cuda_device_runtime_api.h>
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <device_atomic_functions.h>
+#include <driver_types.h>
 #include <sys/types.h>
 #include "graph/slab.cuh"
 #include "graph/checks.cuh"
@@ -44,10 +46,18 @@ __device__ uint32_t alloc_slab(const SlabDir& d){
 	return (s < d.pool_cap) ? s : NULL_SLAB;
 }
 
+// head slab of the bucket where `key` lives in u's list.
+// u owns B_u = bucket_off[u+1]-bucket_off[u] buckets (always >= 1); key goes to bucket hash(key) % B_u
+// TODO: use the hash function your course specifies (this is just a simple multiplicative hash)
+__device__ __forceinline__ uint32_t head_of(const SlabDir& d, uint32_t u, uint32_t key){
+	uint32_t B = d.bucket_off[u + 1] - d.bucket_off[u];
+	return d.bucket_off[u] + (key * 2654435761u) % B;
+}
+
 // does edge (u -> key) exist in u's slab list?  weight returned in *val (all lanes)
 __device__ bool warp_search(const SlabDir& d, uint32_t u, uint32_t key, uint32_t* val){
 	const int lane = lane_id();
-	uint32_t cur = u;
+	uint32_t cur = head_of(d, u, key);                    // only this key's bucket needs searching
 	while (cur != NULL_SLAB){
 		const uint32_t* s = slab_at(d, cur);
 		uint32_t w  = __ldcg(s + lane);                    // whole slab in one transaction
@@ -68,8 +78,8 @@ __device__ bool warp_search(const SlabDir& d, uint32_t u, uint32_t key, uint32_t
 __device__ int warp_upsert(const SlabDir& d, uint32_t u, uint32_t key, uint32_t val){
 	const int lane = lane_id();
 
-	// phase 1: the key may live in ANY slab of the list, so scan the whole list first
-	for (uint32_t cur = u; cur != NULL_SLAB; ){
+	// phase 1: the key can only be in its own bucket, but may be in ANY slab of that bucket's chain
+	for (uint32_t cur = head_of(d, u, key); cur != NULL_SLAB; ){
 		uint32_t* s = slab_at(d, cur);
 		uint32_t w = __ldcg(s + lane);
 		uint32_t hit = __ballot_sync(FULL_MASK, is_key_lane(lane) && w == key);
@@ -82,7 +92,7 @@ __device__ int warp_upsert(const SlabDir& d, uint32_t u, uint32_t key, uint32_t 
 	}
 
 	// phase 2: claim the first EMPTY or TOMBSTONE slot
-	uint32_t cur = u;
+	uint32_t cur = head_of(d, u, key);
 	while (true){
 		uint32_t* s = slab_at(d, cur);
 		uint32_t w  = __ldcg(s + lane);
@@ -119,7 +129,7 @@ __device__ int warp_upsert(const SlabDir& d, uint32_t u, uint32_t key, uint32_t 
 // delete (u -> key): turn the slot into a tombstone. returns 1 if this call removed it
 __device__ int warp_delete(const SlabDir& d, uint32_t u, uint32_t key){
 	const int lane = lane_id();
-	for (uint32_t cur = u; cur != NULL_SLAB; ){
+	for (uint32_t cur = head_of(d, u, key); cur != NULL_SLAB; ){
 		uint32_t* s = slab_at(d, cur);
 		uint32_t w = __ldcg(s + lane);
 		uint32_t hit = __ballot_sync(FULL_MASK, is_key_lane(lane) && w == key);
@@ -180,34 +190,11 @@ __global__ void k_delete(SlabView* G, const Edge* del, int n_del){
 
 __global__ void k_neighbours(SlabDir d, int u, Neighbor* buf, int n_buf, int* count){
 	const int lane = lane_id();
-	uint32_t cur = u;
-	while (cur != NULL_SLAB){
-		const uint32_t* s = slab_at(d, cur);
-		uint32_t key = __ldcg(s+lane);
-		uint32_t wt = __shfl_down_sync(FULL_MASK, key, 1);
-
-		bool live = is_key_lane(lane) && key !=EMPTY_KEY && key != TOMBSTONE;
-		uint32_t bits = __ballot_sync(FULL_MASK, live);
-		int base=0;
-		if (lane == 0){
-			base = atomicAdd(count, __popc(bits));
-		}
-		base = __shfl_sync(FULL_MASK, base, 0);
-		if (live){
-			int slot = base +__popc(bits & ((1u << lane) - 1));
-			if (slot < n_buf) buf[slot] = {(int)key, (int)wt};
-		}
-		cur = __shfl_sync(FULL_MASK, key, NEXT_LANE);
-	}
-}
-
-__global__ void k_edge_list(SlabView* G, Edge* buf, int n_buf, int* count){
-	const int lane = lane_id();
-	for (int u = warp_gid(); u< G->max_n_v; u+=warps_total()){
-		if (!G->valid[u]) continue;
-		uint32_t cur = u;
+	// u now has several buckets: walk the chain of each one
+	for (uint32_t b = d.bucket_off[u]; b < d.bucket_off[u + 1]; b++){
+		uint32_t cur = b;
 		while (cur != NULL_SLAB){
-			const uint32_t* s = slab_at(G->out, cur);
+			const uint32_t* s = slab_at(d, cur);
 			uint32_t key = __ldcg(s+lane);
 			uint32_t wt = __shfl_down_sync(FULL_MASK, key, 1);
 
@@ -220,9 +207,38 @@ __global__ void k_edge_list(SlabView* G, Edge* buf, int n_buf, int* count){
 			base = __shfl_sync(FULL_MASK, base, 0);
 			if (live){
 				int slot = base +__popc(bits & ((1u << lane) - 1));
-				if (slot < n_buf) buf[slot] = {u, (int)key, (int)wt};
+				if (slot < n_buf) buf[slot] = {(int)key, (int)wt};
 			}
 			cur = __shfl_sync(FULL_MASK, key, NEXT_LANE);
+		}
+	}
+}
+
+__global__ void k_edge_list(SlabView* G, Edge* buf, int n_buf, int* count){
+	const int lane = lane_id();
+	for (int u = warp_gid(); u< G->max_n_v; u+=warps_total()){
+		if (!G->valid[u]) continue;
+		// walk every bucket of u's out-list
+		for (uint32_t b = G->out.bucket_off[u]; b < G->out.bucket_off[u + 1]; b++){
+			uint32_t cur = b;
+			while (cur != NULL_SLAB){
+				const uint32_t* s = slab_at(G->out, cur);
+				uint32_t key = __ldcg(s+lane);
+				uint32_t wt = __shfl_down_sync(FULL_MASK, key, 1);
+
+				bool live = is_key_lane(lane) && key !=EMPTY_KEY && key != TOMBSTONE;
+				uint32_t bits = __ballot_sync(FULL_MASK, live);
+				int base=0;
+				if (lane == 0){
+					base = atomicAdd(count, __popc(bits));
+				}
+				base = __shfl_sync(FULL_MASK, base, 0);
+				if (live){
+					int slot = base +__popc(bits & ((1u << lane) - 1));
+					if (slot < n_buf) buf[slot] = {u, (int)key, (int)wt};
+				}
+				cur = __shfl_sync(FULL_MASK, key, NEXT_LANE);
+			}
 		}
 	}
 }
@@ -233,26 +249,39 @@ __global__ void k_remove_vertex(SlabView* G, int u){
 		const SlabDir& mine = (dir == 0) ? G->out : G->in;
 		const SlabDir& other = (dir ==0) ? G->in : G->out;
 
-		uint32_t cur = u;
-		while (cur != NULL_SLAB){
-			const uint32_t* s = slab_at(mine, cur);
-			uint32_t key = __ldcg(s+lane);
+		// walk every bucket of u's list
+		for (uint32_t b = mine.bucket_off[u]; b < mine.bucket_off[u + 1]; b++){
+			uint32_t cur = b;
+			while (cur != NULL_SLAB){
+				const uint32_t* s = slab_at(mine, cur);
+				uint32_t key = __ldcg(s+lane);
 
-			bool live = is_key_lane(lane) && key !=EMPTY_KEY && key != TOMBSTONE;
-			uint32_t bits = __ballot_sync(FULL_MASK, live);
-			int base=0;
-			while (bits){
-				int src = __ffs(bits) - 1;
-    			uint32_t nb = __shfl_sync(FULL_MASK, key, src);
-				int r = warp_delete(other, nb, u);
-				if (lane == 0 && r==1){
-						atomicSub(&other.deg[nb], 1);
-						atomicSub(&G->n_e, 1);
+				bool live = is_key_lane(lane) && key !=EMPTY_KEY && key != TOMBSTONE;
+				uint32_t bits = __ballot_sync(FULL_MASK, live);
+				int base=0;
+				while (bits){
+					int src = __ffs(bits) - 1;
+					uint32_t nb = __shfl_sync(FULL_MASK, key, src);
+					int r = warp_delete(other, nb, u);
+					if (lane == 0 && r==1){
+							atomicSub(&other.deg[nb], 1);
+							atomicSub(&G->n_e, 1);
+					}
+					bits&=bits -1;
 				}
-				bits&=bits -1;
+				cur = __shfl_sync(FULL_MASK, key, NEXT_LANE);
 			}
-			cur = __shfl_sync(FULL_MASK, key, NEXT_LANE);
 		}
+	}
+	// TODO: clear u's own lists (tombstone every live key in ALL of u's buckets, both directions),
+	//       set out.deg[u] = in.deg[u] = 0, and finally valid[u] = false (lane 0)
+}
+
+__global__ void k_get_weights(SlabDir d, int u, int v, int *out){
+	uint32_t val = 0;
+	bool found = warp_search(d, u, v, &val);
+	if (lane_id() == 0){
+		*out = found ? (int)val : -1;
 	}
 }
 
@@ -285,28 +314,39 @@ SlabGraph::SlabGraph(int n_v, int max_n_v, Edge* edge_list, int n_e, int extra_s
 
 SlabGraph::~SlabGraph(){ free_gpu(); }
 
-void SlabGraph::alloc_dir(SlabDir& d, uint32_t cap){
+// bucket_off has max_n_v+1 entries: vertex u owns head slabs [bucket_off[u], bucket_off[u+1])
+// extra = dynamic slabs available on top of the head slabs
+void SlabGraph::alloc_dir(SlabDir& d, const std::vector<uint32_t>& bucket_off, uint32_t extra){
+	uint32_t base_slabs = bucket_off.back();                // total head slabs = sum of B_u
+	uint32_t cap = base_slabs + extra;
 	d.pool_cap = cap;
 	CUDA_CHECK(cudaMalloc((void**)&d.pool, (size_t)cap * SLAB_WORDS * sizeof(uint32_t)));
 	CUDA_CHECK(cudaMemset(d.pool, 0xFF, (size_t)cap * SLAB_WORDS * sizeof(uint32_t)));  // EMPTY keys, NULL next ptrs
 	CUDA_CHECK(cudaMalloc((void**)&d.next_free, sizeof(uint32_t)));
-	uint32_t first_free = (uint32_t)max_n_v;                // slabs [0, max_n_v) are the head slabs
-	CUDA_CHECK(cudaMemcpy(d.next_free, &first_free, sizeof(uint32_t), cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy(d.next_free, &base_slabs, sizeof(uint32_t), cudaMemcpyHostToDevice));  // dynamic slabs start after the heads
+	CUDA_CHECK(cudaMalloc((void**)&d.bucket_off, sizeof(uint32_t) * bucket_off.size()));
+	CUDA_CHECK(cudaMemcpy(d.bucket_off, bucket_off.data(), sizeof(uint32_t) * bucket_off.size(), cudaMemcpyHostToDevice));
 	CUDA_CHECK(cudaMalloc((void**)&d.deg, sizeof(int) * max_n_v));
 	CUDA_CHECK(cudaMemset(d.deg, 0, sizeof(int) * max_n_v));
 }
 
 void SlabGraph::free_dir(SlabDir& d){
-	cudaFree(d.pool); cudaFree(d.next_free); cudaFree(d.deg);
+	cudaFree(d.pool); cudaFree(d.next_free); cudaFree(d.deg); cudaFree(d.bucket_off);
 	d = SlabDir{};
 }
 
 SlabView* SlabGraph::to_gpu(){
 	if (d_ptr != 0) return d_ptr;                          // already uploaded
 
-	uint32_t cap = (uint32_t)max_n_v + (uint32_t)extra_slabs;
-	alloc_dir(h_out, cap);
-	alloc_dir(h_in,  cap);
+	// bucket_off[u] = index of u's first head slab, B_u = bucket_off[u+1] - bucket_off[u]
+	// TODO: count out-/in-degrees from init_edges on the host and choose
+	//       B_u = max(1, ceil(deg / (load_factor * PAIRS_PER))) separately for out and in.
+	//       Every vertex id (even invalid ones) needs B_u >= 1, they may be activated later.
+	// for now: exactly 1 bucket per vertex (same behaviour as the single-list version)
+	std::vector<uint32_t> out_off(max_n_v + 1), in_off(max_n_v + 1);
+	for (int i = 0; i <= max_n_v; i++){ out_off[i] = i; in_off[i] = i; }
+	alloc_dir(h_out, out_off, (uint32_t)extra_slabs);
+	alloc_dir(h_in,  in_off,  (uint32_t)extra_slabs);
 
 	std::vector<char> hv(max_n_v, 0);
 	std::fill(hv.begin(), hv.begin() + n_v, 1);
@@ -424,11 +464,44 @@ int SlabGraph::get_in_deg(int v){
 	return d;
 }
 
-/* ---- TODO: yours ---- */
-bool SlabGraph::has_edge(int u, int v){ return get_weight(u, v) != -1; }
-int  SlabGraph::is_valid(int u){ /* TODO: read d_valid[u] */ return 0; }
-int  SlabGraph::get_weight(int u, int v){ /* TODO: 1-warp kernel calling warp_search on the out-list of u */ return -1; }
-int  SlabGraph::get_in_neighbors(int u, Neighbor* buf, int n){ /* TODO: k_neighbors on h_in */ return 0; }
+bool SlabGraph::has_edge(int u, int v){ 
+	return get_weight(u, v) != -1; 
+}
+int  SlabGraph::is_valid(int u){ 
+	if (u<0 || u>= max_n_v) return 0;
+	if (d_ptr == 0) return 0;
+
+	bool v = false;
+	CUDA_CHECK(cudaMemcpy(&v, d_valid + u, sizeof(bool), cudaMemcpyDeviceToHost));
+	/* DONE */ return v; 
+}
+int  SlabGraph::get_weight(int u, int v){
+	if (u<0 || u>= max_n_v) return -1;
+	if (v<0 || v>= max_n_v) return -1;
+	if (d_ptr == 0) return -1;
+	int val = -1;
+	int * d_res;
+	cudaMalloc(&d_res, sizeof(int));
+	k_get_weights<<<1, 32>>>(h_out, u, v, d_res);
+	CUDA_CHECK(cudaGetLastError());
+	cudaMemcpy(&val, d_res, sizeof(int), cudaMemcpyDeviceToHost);
+	cudaFree(d_res);
+	return val; 
+	/* DONE: 1-warp kernel calling warp_search on the out-list of u */
+}
+int  SlabGraph::get_in_neighbors(int u, Neighbor* buf, int n){ 
+	if (n<=0) return 0;
+	if (u<0 || u>= max_n_v) return -1;
+	if (d_ptr == 0) return -1;
+
+	Neighbor* d_buf;
+	cudaMalloc(&d_buf, sizeof(Neighbor)*n);
+	int * d_count;
+	cudaMalloc(&d_count, sizeof(int));
+	cudaMemset(d_count, 0, sizeof(int)*n);
+
+	/* TODO: k_neighbors on h_in */ return 0; 
+}
 int  SlabGraph::get_out_neighbors(int u, Neighbor* buf, int n){ /* TODO: k_neighbors on h_out */ return 0; }
 int  SlabGraph::edge_list(Edge* buf, int n){ /* TODO */ return 0; }
 void SlabGraph::remove_vertex(int u){ /* TODO */ }
