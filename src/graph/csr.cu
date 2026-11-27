@@ -9,15 +9,6 @@
 #include "graph/types.cuh"
 #include "graph/util.h"
 
-// gives the kernel config (blocks, tpb)
-static void launch_dims(long long threads, int& blocks, int& tpb){
-	if (threads < 1) threads = 1;
-	long long t = ((threads + warpSize-1) / warpSize) * warpSize;
-	tpb = (int)(t < 1024 ? t : 1024); 
-	long long b = (t + tpb - 1) / tpb;
-	blocks = (int)(b < 65535 ? b : 65535);
-}
-
 // allocates and fills value -1
 static int* alloc_neg1(size_t n){
 	size_t bytes = sizeof(int) * (n ? n : 1);
@@ -1101,11 +1092,5 @@ void CSR::sync_graph(){
 	gpu_dirty = false;
 }
 
-template<class O, class F, class P>
-int CSR::vmfb(O* op, int n_op, F&& f, bool* flags, int n_f,
-			  P&& pred, int* buf, int n_buf){
-	// 3-steps
-	// applies f on operands in parallel and alters flags based on f
-	// synchronization
-	// fills into buf based on flags and pred in parallel
-}
+
+

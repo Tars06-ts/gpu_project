@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include "graph/igraph.h"
 #include "graph/types.cuh"
+#include <algorithm>
+#include "graph/checks.cuh"
 
 struct CSRView {
 	// maximum number of vertices
@@ -27,6 +29,56 @@ struct CSRView {
 	int *in_offset, *in_edges, *in_weights, *in_used;
 	int *out_offset, *out_edges, *out_weights, *out_used;
 };
+
+
+// NOTE: As they are template function they need to be in header file 
+
+template<class O, class F>
+__global__ void d_helper_vmfb_mark(O* op, int n_op, F f, bool* flags, int n_f) {
+    int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    if (tid < n_op) {
+        f(op, n_op, flags, n_f, tid);
+    }
+}
+
+template<class P>
+__global__ void d_helper_vmfb_filter(const bool* flags, int n_f, P pred, int* buf, int n_buf, int* d_buf_count) {
+    int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    int lane_id = threadIdx.x & 31; // threadIdx.x % 32
+
+    bool is_active = (tid < n_f) && pred(flags[tid]);
+    unsigned int active_threads = __ballot_sync(0xFFFFFFFF, is_active);
+
+    if (active_threads == 0) return;
+
+    int leader_lane = __ffs(active_threads) - 1;
+    int warp_offset = 0;
+
+    if (lane_id == leader_lane) {
+        int warp_total_active = __popc(active_threads);
+        warp_offset = atomicAdd(d_buf_count, warp_total_active);
+    }
+
+    // Broadcast the base offset from leader_lane to all lanes in the warp
+    warp_offset = __shfl_sync(0xFFFFFFFF, warp_offset, leader_lane);
+
+    if (is_active) {
+        int offset = __popc(((1u << lane_id) - 1) & active_threads);
+        int idx = warp_offset + offset;
+        if (idx < n_buf) {
+            buf[idx] = tid;
+        }
+    }
+}
+
+// gives the kernel config (blocks, tpb)
+static void launch_dims(long long threads, int& blocks, int& tpb){
+	if (threads < 1) threads = 1;
+	long long t = ((threads + 32 - 1) / 32) * 32;
+	tpb = (int)(t < 1024 ? t : 1024); 
+	long long b = (t + tpb - 1) / tpb;
+	blocks = (int)(b < 65535 ? b : 65535);
+}
 
 class CSR : public IGraph {
 	// maximum number of vertices
@@ -144,7 +196,40 @@ public:
 	 * fills the list of vertices for whom predicate is true in buf and
 	 * returns the number of vertices filled in buf of max size n_buf*/
 	template<class O, class F, class P>
-	int vmfb(O* op, int n_op, F&& f, bool* flags, int n_f, P&& pred, int* buf, int n_buf);
+	int vmfb(O* op, int n_op, F f, bool* flags, int n_f,
+				P pred, int* buf, int n_buf) {
+		int blocks, tpb;
+
+		// Vertex Marking
+		if (n_op > 0) {
+			launch_dims(n_op, blocks, tpb);
+			d_helper_vmfb_mark<<<blocks, tpb>>>(op, n_op, f, flags, n_f);
+			CUDA_CHECK(cudaGetLastError());
+		}
+
+		// Synchronization
+		CUDA_CHECK(cudaDeviceSynchronize());
+
+		// Filter
+		if (n_f <= 0 || n_buf <= 0) return 0;
+
+		int* d_buf_count = nullptr;
+		CUDA_CHECK(cudaMalloc(&d_buf_count, sizeof(int)));
+		CUDA_CHECK(cudaMemset(d_buf_count, 0, sizeof(int)));
+
+		launch_dims(n_f, blocks, tpb);
+		d_helper_vmfb_filter<<<blocks, tpb>>>(flags, n_f, pred, buf, n_buf, d_buf_count);
+		CUDA_CHECK(cudaGetLastError());
+		CUDA_CHECK(cudaDeviceSynchronize());
+
+		int buf_actual_size = 0;
+		CUDA_CHECK(cudaMemcpy(&buf_actual_size, d_buf_count, sizeof(int), cudaMemcpyDeviceToHost));
+		CUDA_CHECK(cudaFree(d_buf_count));
+
+		return std::min(buf_actual_size, n_buf);
+	}
+
 };
+
 
 #endif
