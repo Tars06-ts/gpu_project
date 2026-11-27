@@ -8,7 +8,7 @@
 #include <cuda.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include "graph/igraph.cuh"
+#include "graph/igraph.h"
 #include "graph/types.cuh"
 
 struct CSRView {

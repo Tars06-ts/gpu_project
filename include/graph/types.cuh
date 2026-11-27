@@ -16,5 +16,4 @@ struct InsertCtx {
 	int  *out_needed, *in_needed, *out_slots, *in_slots;
 };
 
-
 #endif

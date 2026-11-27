@@ -2,14 +2,8 @@
 #define IGRAPH_HPP
 
 #include <vector>
-
-struct Edge{
-    int u, v, weight;
-};
-
-struct Neighbor{
-    int v, weight;
-};
+#include "graph/types.h"
+#include "graph/igraph.h"
 
 class IGraph{
 public:
