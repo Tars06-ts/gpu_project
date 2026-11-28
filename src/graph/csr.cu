@@ -47,7 +47,8 @@ __global__ void d_helper_edge(int u, int v, int* wt, CSRView* G){
 			}
 			start += warpSize;
 		}
-	}else if (tid/32 == 1){
+	}
+	else if (tid/32 == 1){
 		int start = G->in_offset[v] + laneId;
 		int end = G->in_offset[v+1];
 		while (start-laneId < end && !found){
@@ -56,7 +57,7 @@ __global__ void d_helper_edge(int u, int v, int* wt, CSRView* G){
 			}
 			int m = __ballot_sync(0xFFFFFFFF, found);
 			if (m!=0 && __ffs(m)-1==laneId){
-				*wt = G->out_weights[start];
+				*wt = G->in_weights[start];
 			}
 			if (m!=0){
 				break;
@@ -64,6 +65,23 @@ __global__ void d_helper_edge(int u, int v, int* wt, CSRView* G){
 			start += warpSize;
 		}
 	}
+	// else if (tid/32 == 1){
+	// 	int start = G->in_offset[v] + laneId;
+	// 	int end = G->in_offset[v+1];
+	// 	while (start-laneId < end && !found){
+	// 		if (start < end && G->in_edges[start] == u){
+	// 			found = true;
+	// 		}
+	// 		int m = __ballot_sync(0xFFFFFFFF, found);
+	// 		if (m!=0 && __ffs(m)-1==laneId){
+	// 			*wt = G->out_weights[start];
+	// 		}
+	// 		if (m!=0){
+	// 			break;
+	// 		}
+	// 		start += warpSize;
+	// 	}
+	// }
 }
 
 __global__ void d_helper_neighbors(int u, Neighbor* buf, int n_buf,
@@ -130,9 +148,10 @@ __global__ void d_helper_pack_edges(int max_v, int min_v,
 			continue;
 		}
 		int lane = threadIdx.x % warpSize;
-		int start = offset[u];
+		int orig_start = offset[u];
+		int start = orig_start;
 		int end = offset[u+1];
-		int dst = start;
+		int dst = orig_start;
 		while (start < end){
 			int idx = start + lane;
 			bool live = (idx < end) && (edges[idx] != -1);
@@ -158,7 +177,7 @@ __global__ void d_helper_pack_edges(int max_v, int min_v,
 		}
 		__syncwarp();
 		if (lane==0){
-			used[u] = dst-start;
+			used[u] = dst - orig_start;
 		}
 		u += (gridDim.x * blockDim.x) / warpSize;
 	}
@@ -653,7 +672,7 @@ int CSR::edge_list(Edge* buf, int n){
 	CUDA_CHECK(cudaMalloc((void**)&d_buf, sizeof(Edge)*n));
 	
 	int tpb = 256;
-	int total_threads = n_v * warpSize;
+	int total_threads = n_v * WARP_SIZE;
 	int blocks = (total_threads + tpb - 1)/ tpb;
 	blocks = std::min(blocks, 65535);
 
@@ -676,7 +695,7 @@ void CSR::pack_all(cudaStream_t s1, cudaStream_t s2){
 	int span = max_v - min_v + 1;
 	if (span <= 0) return;
 	int blocks, tpb;
-	launch_dims((long long)span * warpSize, blocks, tpb);
+	launch_dims((long long)span * WARP_SIZE, blocks, tpb);
 	d_helper_pack_edges<<<blocks, tpb, 0, s1>>>(max_v, min_v, d_out_edges,
 			d_out_weights, d_out_offset, d_out_used, d_valid);
 	CUDA_CHECK(cudaGetLastError());
@@ -706,7 +725,7 @@ void CSR::remove_vertex(int u){
 
 	// convert every edge touching u into tombstone
 	int blocks, tpb;
-	launch_dims((long long)(max_v - min_v + 1) * warpSize, blocks, tpb);
+	launch_dims((long long)(max_v - min_v + 1) * WARP_SIZE, blocks, tpb);
 	d_helper_remove_vertex<<<blocks, tpb, 0, s1>>>(u, max_v, min_v,
 			d_in_offset, d_in_edges, d_in_weights, d_in_used,
 			d_out_offset, d_out_edges, d_out_weights, d_out_used);
@@ -875,7 +894,7 @@ void CSR::ins_rebuild(InsertCtx& c, cudaStream_t s1, cudaStream_t s2){
 	int *n_in_e  = alloc_neg1(e_in),  *n_in_w  = alloc_neg1(e_in);
 
 	// copy live edges: one warp per vertex
-	launch_dims((long long)V * warpSize, blocks, tpb);
+	launch_dims((long long)V * WARP_SIZE, blocks, tpb);
 	d_helper_copy_from_old_to_new<<<blocks, tpb, 0, s1>>>(d_out_used, d_out_edges,
 			d_out_weights, d_out_offset, n_out_e, n_out_w, n_out_off, V, d_ptr);
 	CUDA_CHECK(cudaGetLastError());
@@ -905,7 +924,7 @@ void CSR::ins_update_existing(InsertCtx& c, cudaStream_t s1, cudaStream_t s2){
 	CUDA_CHECK(cudaMemset(c.is_update, 0, sizeof(bool) * c.n_ins));
 
 	int blocks, tpb;
-	launch_dims((long long)c.n_ins * warpSize, blocks, tpb);     // a warp per insertion
+	launch_dims((long long)c.n_ins * WARP_SIZE, blocks, tpb);     // a warp per insertion
 	d_helper_update_existing_edges<<<blocks, tpb, 0, s1>>>(c.ins, c.n_ins,
 			d_in_edges, d_in_weights, d_in_offset, true,
 			c.pool, c.is_update);

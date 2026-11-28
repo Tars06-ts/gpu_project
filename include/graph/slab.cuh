@@ -4,7 +4,7 @@
 #include <vector>
 #include <cstdint>
 #include <cuda_runtime.h>
-#include "graph/igraph.cuh"
+#include "graph/igraph.h"
 #include "graph/types.cuh"
 
 /* ---------------------------------------------------------------------

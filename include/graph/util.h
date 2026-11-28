@@ -3,6 +3,8 @@
 
 #define MIN_SLACK 20
 
+constexpr int WARP_SIZE = 32;
+
 inline int next_power_of_2(int u){
     if (u <= 1) return 1;
     // Prevent signed overflow for values > 2^30 (1,073,741,824)

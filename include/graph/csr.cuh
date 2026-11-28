@@ -28,6 +28,32 @@ struct CSRView {
 	// *_edges, *_weights has n_e elements
 	int *in_offset, *in_edges, *in_weights, *in_used;
 	int *out_offset, *out_edges, *out_weights, *out_used;
+
+
+	template<typename Fn>
+	__device__ void for_each_out_neighbor(int u, Fn&& fn) const {
+		int start = out_offset[u];
+		int end = start + out_used[u];
+		for (int i = start; i < end; ++i) {
+			int v = out_edges[i];
+			if (v >= 0) {
+				fn(v, out_weights[i]);
+			}
+		}
+	}
+
+	template<typename Fn>
+	__device__ void for_each_in_neighbor(int u, Fn&& fn) const {
+		int start = in_offset[u];
+		int end = start + in_used[u];
+		for (int i = start; i < end; ++i) {
+			int v = in_edges[i];
+			if (v >= 0) {
+				fn(v, in_weights[i]);
+			}
+		}
+	}
+	
 };
 
 
